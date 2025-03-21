@@ -92,7 +92,7 @@ except Exception as e:
     st.stop()
 
 # Fill any missing forecast values
-test['arima_forecast'] = test['arima_forecast'].fillna(method='ffill').fillna(method='bfill')
+test['arima_forecast'] = test['arima_forecast'].ffill().bfill()
 
 # -------------------------------
 # 5. Compute Residuals
@@ -131,7 +131,8 @@ residual_preds = np.nan_to_num(residual_preds)
 # 7. Compute Final Forecast
 # -------------------------------
 test['final_forecast'] = test['arima_forecast'] + residual_preds
-test['final_forecast'] = test['final_forecast'].fillna(method='ffill').fillna(method='bfill')
+test['final_forecast'] = test['final_forecast'].ffill().bfill()
+
 
 # -------------------------------
 # 8. Evaluate Model Performance
