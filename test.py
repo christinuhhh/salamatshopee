@@ -337,29 +337,14 @@ fig_future.update_layout(title="Hybrid ARIMA + XGBoost 30-Day Forecast",
 st.plotly_chart(fig_future, use_container_width=True)
 
 # =============================================================================
-# SECTION 4: Combined Forecast Table
+# SECTION 4: Future Forecast Table (Only)
 # =============================================================================
-st.header("Combined Forecast Table")
-
-# Prepare historical forecast table from test period
-hist_forecast_df = test[['report_date', target, 'final_forecast']].copy()
-hist_forecast_df = hist_forecast_df.rename(columns={target: "Actual", "final_forecast": "Hybrid_Forecast"})
-hist_forecast_df["Type"] = "Historical Forecast"
+st.header("Future Forecast Table")
 
 # Prepare future forecast table from future_df
 future_forecast_df = future_df.copy()
-future_forecast_df["Actual"] = np.nan  # No actual values for the future period
+future_forecast_df["Forecast"] = jan_final_forecast.tolist() if hasattr(jan_final_forecast, 'tolist') else jan_final_forecast
 
-# Convert the numpy array to a list to avoid assignment issues
-future_forecast_values = jan_final_forecast.tolist() if hasattr(jan_final_forecast, 'tolist') else jan_final_forecast
-future_forecast_df["Hybrid_Forecast"] = future_forecast_values
-future_forecast_df["Type"] = "Future Forecast"
+# Show only the date and forecast number
+st.dataframe(future_forecast_df[['report_date', "Forecast"]])
 
-# Combine the two tables
-combined_df = pd.concat([
-    hist_forecast_df[['report_date', "Actual", "Hybrid_Forecast", "Type"]],
-    future_forecast_df[['report_date', "Actual", "Hybrid_Forecast", "Type"]]
-], ignore_index=True)
-
-combined_df.sort_values(by="report_date", inplace=True)
-st.dataframe(combined_df)
