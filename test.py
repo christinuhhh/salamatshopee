@@ -10,7 +10,111 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 # =============================================================================
-# Custom CSS for Dark Orange Accent
+# Custom CSS to Hide Index in st.dataframe (for scrollable tables)
+# =============================================================================
+st.markdown(
+    """
+    <style>
+    /* Hide index column in all st.dataframe outputs */
+    div[data-testid="stDataFrameContainer"] table thead tr th:first-child,
+    div[data-testid="stDataFrameContainer"] table tbody tr th {
+        display: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# =============================================================================
+# Define forecast_station Function
+# =============================================================================
+def forecast_station(csv_file, features, target, arima_order=(1, 1, 1)):
+    try:
+        df_station = pd.read_csv(csv_file)
+    except Exception as e:
+        st.error(f"Error loading data from {csv_file}: {e}")
+        return None
+    
+    if 'report_date' not in df_station.columns:
+        st.error(f"Column 'report_date' not found in {csv_file}.")
+        return None
+
+    # Preprocess the data
+    df_station['report_date'] = pd.to_datetime(df_station['report_date'])
+    df_station = df_station.sort_values(by='report_date').reset_index(drop=True)
+    
+    # Check for required columns
+    missing_cols = [col for col in features + [target] if col not in df_station.columns]
+    if missing_cols:
+        st.error(f"Missing columns in {csv_file}: {missing_cols}")
+        return None
+
+    df_station = df_station.dropna(subset=features + [target]).copy()
+
+    # Use data up to January 1, 2025 for future prediction
+    train_future = df_station[df_station['report_date'] < "2025-01-01"].copy()
+    if train_future.empty:
+        st.error(f"Training set for future prediction is empty in {csv_file}.")
+        return None
+
+    # Create future dates for the next 30 days
+    last_date = train_future['report_date'].max()
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=30)
+    future_df = pd.DataFrame({'report_date': future_dates})
+    
+    # Create date-based features for future_df
+    future_df['dayofweek'] = future_df['report_date'].dt.dayofweek
+    future_df['month'] = future_df['report_date'].dt.month
+    # For the remaining features, use the last observed values from train_future
+    for feat in ['rr_pu_vol_lag1', 'total_delivery_vol_lag1', 'rr_pu_vol_ma7', 
+                 'total_delivery_vol_ma7', 'user_delivery_interaction', 'sale_event']:
+        future_df[feat] = train_future[feat].iloc[-1]
+    future_X = future_df[features]
+    
+    # Fit ARIMA on the target using train_future data
+    try:
+        arima_model_future = ARIMA(train_future[target], order=arima_order).fit()
+    except Exception as e:
+        st.error(f"Error fitting ARIMA model for {csv_file}: {e}")
+        return None
+
+    # Forecast using ARIMA for next 30 days
+    try:
+        arima_forecast = arima_model_future.forecast(steps=30)
+    except Exception as e:
+        st.error(f"Error forecasting with ARIMA for {csv_file}: {e}")
+        return None
+
+    # Compute residuals on the training data
+    train_future['arima_fitted'] = arima_model_future.fittedvalues
+    train_future['residual'] = train_future[target] - train_future['arima_fitted']
+    
+    # Train XGBoost on the residuals
+    x_train_future, x_val_future, y_train_future, y_val_future = train_test_split(
+        train_future[features], train_future['residual'], test_size=0.2, random_state=42)
+    xgb_model_future = XGBRegressor(n_estimators=500,
+                                    learning_rate=0.05,
+                                    max_depth=7,
+                                    subsample=0.9,
+                                    colsample_bytree=0.8,
+                                    eval_metric='mae',
+                                    random_state=42)
+    try:
+        xgb_model_future.fit(x_train_future, y_train_future)
+    except Exception as e:
+        st.error(f"Error training XGBoost for future prediction in {csv_file}: {e}")
+        return None
+
+    # Predict the residual corrections for the future dates
+    jan_residual_preds = xgb_model_future.predict(future_X)
+    jan_residual_preds = np.nan_to_num(jan_residual_preds)
+    jan_final_forecast = arima_forecast + jan_residual_preds
+
+    future_df["Forecast"] = jan_final_forecast.tolist() if hasattr(jan_final_forecast, 'tolist') else jan_final_forecast
+    return future_df[["report_date", "Forecast"]]
+
+# =============================================================================
+# Custom CSS for Dark Orange Accent (rest of CSS remains)
 # =============================================================================
 st.markdown(
     """
@@ -24,19 +128,19 @@ st.markdown(
         background-color: #FF8C00;
         color: white;
     }
-    /* Add some padding to the main container */
+    /* Add padding to the main container */
     .reportview-container .main .block-container {
-        padding-top: 2rem;
-        padding-right: 2rem;
-        padding-left: 2rem;
-        padding-bottom: 2rem;
+        padding: 2rem;
     }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-st.title("Hybrid ARIMA + XGBoost Forecasting App")
+# =============================================================================
+# App Title and Introduction
+# =============================================================================
+st.title("Hybrid ARIMA + XGBoost Forecasting")
 st.write("""
 This application loads a processed CSV file, fits an ARIMA model on the target, trains an XGBoost model on the ARIMA residuals, and produces forecasts.
 """)
@@ -44,7 +148,7 @@ This application loads a processed CSV file, fits an ARIMA model on the target, 
 # =============================================================================
 # SECTION 0: Forecast Volume by Station and Area Cluster Preselection
 # =============================================================================
-st.header("Forecast Volume by Station and Area Cluster (Next 30 Days)")
+st.header("Forecast Volume by Area Cluster and Station in the Next 30 Days")
 
 # Mapping data from your table
 data = {
@@ -86,6 +190,8 @@ selected_cluster = st.selectbox("Select Area Cluster", area_clusters)
 # Filter the mapping based on the selected area cluster
 filtered_mapping = df_mapping[df_mapping["area_cluster"] == selected_cluster]
 st.write(f"Forecast Volume for Area Cluster: **{selected_cluster}**")
+
+# Display station table as an interactive, scrollable table (index hidden by CSS)
 st.dataframe(filtered_mapping)
 
 # Let the user choose a station within the selected area cluster
@@ -168,7 +274,7 @@ df = df.dropna(subset=features + [target]).copy()
 # =============================================================================
 # SECTION 2: Historical Forecast (Model Fit)
 # =============================================================================
-st.header("Historical Forecast (Model Fit)")
+st.header("Model Fit")
 
 # Split data: training (before December 2024) and testing (December 2024 onward)
 train = df[df['report_date'] < "2024-12-01"].copy()
@@ -178,7 +284,7 @@ if train.empty or test.empty:
     st.error("Either the training or testing set is empty. Check your 'report_date' range.")
     st.stop()
 
-# Fit ARIMA on training data
+# Set ARIMA order (and store globally for later use)
 arima_order = (1, 1, 1)
 st.write(f"Using ARIMA order: {arima_order}")
 
@@ -345,6 +451,103 @@ st.header("Future Forecast Table")
 future_forecast_df = future_df.copy()
 future_forecast_df["Forecast"] = jan_final_forecast.tolist() if hasattr(jan_final_forecast, 'tolist') else jan_final_forecast
 
-# Show only the date and forecast number
+# Display the future forecast table as an interactive, scrollable table (index hidden by CSS)
 st.dataframe(future_forecast_df[['report_date', "Forecast"]])
 
+# =============================================================================
+# SECTION 5: Total Volume Over Time with Forecast Option (Combined Section)
+# =============================================================================
+st.header("Total Volume Over Time Based on Selection")
+
+# Let the user select the stations (for both historical and forecast)
+station_selection_option = st.radio("Select Station Option for Total Volume", ("Whole Area Cluster", "Select Stations"))
+if station_selection_option == "Whole Area Cluster":
+    stations_selected = df_mapping[df_mapping["area_cluster"] == selected_cluster]["station_id"].tolist()
+else:
+    stations_in_cluster = df_mapping[df_mapping["area_cluster"] == selected_cluster]["station_id"].tolist()
+    stations_selected = st.multiselect("Select Stations for Volume/Forecast", stations_in_cluster, default=[selected_station])
+
+if not stations_selected:
+    st.error("No stations selected for volume/forecast.")
+else:
+    # Choose whether to show historical data + forecast or only the forecast
+    graph_type = st.radio("Select Graph Type", ("All Over Time (Historical + Forecast)", "Forecast Only"))
+    
+    # Aggregate Historical Data
+    dfs_hist = []
+    for station in stations_selected:
+        station_idx = station_mapping.get(station)
+        csv_file_station = f"csv_files/Processed_Stations/station_{station_idx}_with_sale_events.csv"
+        try:
+            df_station = pd.read_csv(csv_file_station, usecols=["report_date", "rr_pu_vol"])
+            df_station['report_date'] = pd.to_datetime(df_station['report_date'])
+            dfs_hist.append(df_station)
+        except Exception as e:
+            st.error(f"Error loading historical data for station {station}: {e}")
+    if dfs_hist:
+        df_hist_all = pd.concat(dfs_hist)
+        hist_total_volume_df = df_hist_all.groupby("report_date")["rr_pu_vol"].sum().reset_index()
+        hist_total_volume_df = hist_total_volume_df.sort_values("report_date")
+    else:
+        hist_total_volume_df = None
+
+    # Aggregate 30-Day Forecast Data Using the forecast_station Function
+    all_forecasts = []
+    for station in stations_selected:
+        station_idx = station_mapping.get(station)
+        csv_file_station = f"csv_files/Processed_Stations/station_{station_idx}_with_sale_events.csv"
+        forecast_df = forecast_station(csv_file_station, features, target, arima_order)
+        if forecast_df is not None:
+            forecast_df = forecast_df.rename(columns={"Forecast": f"Forecast_{station}"})
+            all_forecasts.append(forecast_df.set_index("report_date"))
+    
+    if all_forecasts:
+        combined_forecast = pd.concat(all_forecasts, axis=1)
+        combined_forecast["Total_Forecast"] = combined_forecast.sum(axis=1)
+        combined_forecast = combined_forecast.reset_index()
+    else:
+        combined_forecast = None
+
+    # Plot the Desired Graph Based on User Choice
+    if graph_type == "All Over Time (Historical + Forecast)":
+        if hist_total_volume_df is not None and combined_forecast is not None:
+            forecast_plot_df = combined_forecast.rename(columns={"Total_Forecast": "rr_pu_vol"})
+            full_data = pd.concat([hist_total_volume_df, forecast_plot_df], ignore_index=True)
+            full_data = full_data.sort_values("report_date")
+            
+            fig_full = px.line(
+                full_data,
+                x="report_date",
+                y="rr_pu_vol",
+                labels={"rr_pu_vol": "Total Volume", "report_date": "Date"},
+                title="Historical Data and 30-Day Forecast Total Volume Over Time"
+            )
+            st.plotly_chart(fig_full, use_container_width=True)
+            
+            # Add a table for the aggregated Total Volume data
+            st.subheader("Aggregated Total Volume Data")
+            st.dataframe(full_data)
+        elif hist_total_volume_df is not None:
+            st.warning("Forecast data is not available. Showing historical data only.")
+            st.dataframe(hist_total_volume_df)
+        elif combined_forecast is not None:
+            st.warning("Historical data is not available. Showing forecast data only.")
+            st.dataframe(combined_forecast)
+        else:
+            st.error("No data available for plotting.")
+    else:  # Forecast Only
+        if combined_forecast is not None:
+            st.plotly_chart(
+                px.line(
+                    combined_forecast,
+                    x="report_date",
+                    y="Total_Forecast",
+                    labels={"Total_Forecast": "Total Forecast Volume", "report_date": "Date"},
+                    title="30-Day Forecast Total Volume Over Time"
+                ),
+                use_container_width=True
+            )
+            st.subheader("Aggregated Forecast Data")
+            st.dataframe(combined_forecast)
+        else:
+            st.error("No forecast data available for the selected stations.")
